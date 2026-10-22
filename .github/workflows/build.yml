@@ -1,0 +1,118 @@
+name: graft
+run-name: graft ${{ inputs.output_name || 'binary' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      binary_url:
+        description: "Google Drive link (share=anyone) or direct URL to the Mach-O you want grafted"
+        required: true
+        type: string
+      offsets:
+        description: "Hooks to graft. Format: Name=0xRVA, Name2=0xRVA2 (comma or semicolon separated). RVA is hex, 4-byte aligned, relative to image base 0x100000000"
+        required: true
+        type: string
+      output_name:
+        description: "Name of the grafted file inside the artifact"
+        required: false
+        default: "binary_grafted"
+        type: string
+      frida_version:
+        description: "frida-gum version used to build gum-graft (must match the version inside the binary)"
+        required: false
+        default: "17.2.11"
+        type: string
+
+concurrency:
+  group: graft-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  graft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config libglib2.0-dev libffi-dev libcapstone-dev python3-pip
+          pip install --quiet gdown
+
+      - name: gum-graft
+        env:
+          FRIDA: ${{ inputs.frida_version }}
+        run: |
+          set -euo pipefail
+          curl -sSL -o devkit.tar.xz "https://github.com/frida/frida/releases/download/$FRIDA/frida-gum-devkit-$FRIDA-linux-x86_64.tar.xz"
+          mkdir -p devkit inc/gum
+          tar -xf devkit.tar.xz -C devkit
+          cp devkit/frida-gum.h inc/gum/gum.h
+          git clone -q --depth 1 --branch "$FRIDA" --filter=blob:none --sparse https://github.com/frida/frida-gum.git gum-src
+          git -C gum-src sparse-checkout set tools/gum-graft
+          gcc -O2 -o gum-graft gum-src/tools/gumgraft.c -I inc -L devkit devkit/libfrida-gum.a \
+            $(pkg-config --cflags --libs glib-2.0 gio-2.0 gobject-2.0) -lffi -lcapstone -lm -ldl -lpthread -lresolv
+          ./gum-graft 2>&1 | head -3 || true
+
+      - name: fetch binary
+        env:
+          URL: ${{ inputs.binary_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          case "$URL" in
+            *drive.google.com*|*docs.google.com*)
+              gdown --fuzzy "$URL" -O work/input.bin
+              ;;
+            *)
+              curl -sSL --retry 3 --retry-delay 2 -o work/input.bin "$URL"
+              ;;
+          esac
+          file work/input.bin
+          test "$(head -c 4 work/input.bin | od -An -tx1 | tr -d ' \n')" = "cffaedfe" \
+            || { echo "not a little-endian 64-bit Mach-O"; exit 1; }
+
+      - name: offsets
+        env:
+          OFFSETS: ${{ inputs.offsets }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$OFFSETS" > work/offsets.txt
+          cat work/offsets.txt
+
+      - name: graft
+        run: |
+          set -euo pipefail
+          python3 tools/graft.py --binary work/input.bin --offsets work/offsets.txt \
+            --tool ./gum-graft --out work/input.bin --report work/graft-report.json
+          mv work/input.bin "work/${{ inputs.output_name }}"
+
+      - name: summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os
+          path = "work/graft-report.json"
+          if not os.path.exists(path):
+              print("report missing")
+              raise SystemExit(0)
+          data = json.load(open(path))
+          lines = ["| hook | RVA | trampoline | ok |", "|---|---|---|---|"]
+          for row in data["hooks"]:
+              lines.append("| `%s` | `%s` | `%s` | %s |" % (row["name"], hex(row["rva"]), row["trampoline"], row["ok"]))
+          lines.append("")
+          lines.append("segments: `__FRIDA_TEXT%d` @ `%s`" % (data["new_segment_index"], data["frida_text"]))
+          lines.append("size: %d bytes, issues: %s" % (data["size"], data["issues"] or "none"))
+          open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout"), "a").write("\n".join(lines) + "\n")
+          PY
+
+      - name: artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grafted-${{ github.run_number }}
+          path: work/
+          if-no-files-found: error
+          retention-days: 7
