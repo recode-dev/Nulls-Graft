@@ -39,7 +39,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential pkg-config libglib2.0-dev libffi-dev libcapstone-dev python3-pip
-          pip install --quiet gdown
+          python3 -m pip install --quiet --upgrade --break-system-packages "gdown>=5"
 
       - name: gum-graft
         env:
@@ -64,7 +64,7 @@ jobs:
           mkdir -p work
           case "$URL" in
             *drive.google.com*|*docs.google.com*)
-              gdown --fuzzy "$URL" -O work/input.bin
+              python3 -m gdown "$URL" -O work/input.bin
               ;;
             *)
               curl -sSL --retry 3 --retry-delay 2 -o work/input.bin "$URL"
