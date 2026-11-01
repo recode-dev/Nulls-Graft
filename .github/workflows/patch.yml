@@ -1,0 +1,168 @@
+name: patch
+run-name: patch ${{ inputs.output_name || 'binary' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      binary_url:
+        description: "Google Drive link (share=anyone) or direct URL to the Mach-O you want patched"
+        required: true
+        type: string
+      patches:
+        description: "Patches. Format: 0xRVA=D65F03C0 (hex, 32-bit ARM64 words, written little-endian), 0xRVA=bytes:C0035FD6 (raw bytes), 0xRVA=f32:7.5. Comma or semicolon separated. RVA is hex relative to image base 0x100000000"
+        required: true
+        type: string
+      output_name:
+        description: "Name of the patched file inside the artifact"
+        required: false
+        default: "binary_patched"
+        type: string
+
+concurrency:
+  group: patch-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: deps
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --break-system-packages "gdown>=5"
+
+      - name: fetch binary
+        env:
+          URL: ${{ inputs.binary_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          case "$URL" in
+            *drive.google.com*|*docs.google.com*)
+              python3 -m gdown "$URL" -O work/input.bin
+              ;;
+            *)
+              curl -sSL --retry 3 --retry-delay 2 -o work/input.bin "$URL"
+              ;;
+          esac
+          file work/input.bin
+          test "$(head -c 4 work/input.bin | od -An -tx1 | tr -d ' \n')" = "cffaedfe" \
+            || { echo "not a little-endian 64-bit Mach-O"; exit 1; }
+
+      - name: patch
+        env:
+          PATCHES: ${{ inputs.patches }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, struct
+          path = "work/input.bin"
+          patches = []
+          for chunk in os.environ["PATCHES"].replace(";", ",").replace("\n", ",").split(","):
+              item = chunk.strip()
+              if not item:
+                  continue
+              addr, sep, value = item.partition("=")
+              if not sep:
+                  raise SystemExit("bad patch item: %r (want RVA=HEXWORDS or RVA=bytes:HEX or RVA=f32:VALUE)" % item)
+              rva = int(addr.strip(), 16)
+              value = value.strip()
+              if value.startswith("f32:"):
+                  payload = struct.pack("<f", float(value[4:]))
+              elif value.startswith("f64:"):
+                  payload = struct.pack("<d", float(value[4:]))
+              elif value.startswith("bytes:"):
+                  payload = bytes.fromhex(value[6:].replace(" ", ""))
+              else:
+                  digits = value.replace(" ", "")
+                  if not digits or len(digits) % 8:
+                      raise SystemExit("hex payload must be 32-bit words (8 digits each) or use bytes:/f32:/f64: %r" % item)
+                  payload = b"".join(struct.pack("<I", int(digits[i:i + 8], 16)) for i in range(0, len(digits), 8))
+              if not payload:
+                  raise SystemExit("empty payload for %s" % hex(rva))
+              patches.append((rva, payload))
+          if not patches:
+              raise SystemExit("no patches parsed")
+          data = open(path, "rb").read()
+          if data[:4] != b"\xcf\xfa\xed\xfe":
+              raise SystemExit("not little-endian 64-bit Mach-O")
+          ncmds = struct.unpack_from("<I", data, 16)[0]
+          segs = []
+          off = 32
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack_from("<II", data, off)
+              if cmd == 0x19:
+                  name = data[off + 8:off + 24].split(b"\x00")[0].decode()
+                  vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", data, off + 24)
+                  segs.append((name, vmaddr, vmsize, fileoff, filesize))
+              off += cmdsize
+          text = next((s for s in segs if s[0] == "__TEXT"), None)
+          if text is None:
+              raise SystemExit("no __TEXT segment")
+          base = text[1]
+          buf = bytearray(data)
+          rows = []
+          for rva, payload in patches:
+              va = base + rva
+              seg = next((s for s in segs if s[1] <= va < s[1] + s[2]), None)
+              if seg is None:
+                  raise SystemExit("rva %s outside any segment" % hex(rva))
+              fptr = va - seg[1] + seg[3]
+              if fptr + len(payload) > seg[3] + seg[4]:
+                  raise SystemExit("rva %s crosses end of %s" % (hex(rva), seg[0]))
+              before = bytes(buf[fptr:fptr + len(payload)])
+              buf[fptr:fptr + len(payload)] = payload
+              rows.append({"rva": hex(rva), "va": hex(va), "segment": seg[0],
+                           "fileoff": hex(fptr), "before": before.hex(),
+                           "after": payload.hex(), "ok": False})
+          open(path, "wb").write(buf)
+          check = open(path, "rb").read()
+          for row in rows:
+              fptr = int(row["fileoff"], 16)
+              size = len(row["after"]) // 2
+              row["ok"] = check[fptr:fptr + size] == bytes.fromhex(row["after"])
+              print("%s @ %s [%s] %s -> %s %s" % (row["rva"], row["va"], row["segment"],
+                                                  row["before"], row["after"],
+                                                  "ok" if row["ok"] else "FAIL"))
+          bad = [r for r in rows if not r["ok"]]
+          json.dump({"binary": os.path.basename(path), "size": len(check), "base": hex(base),
+                     "patches": rows, "issues": [r["rva"] for r in bad]},
+                    open("work/patch-report.json", "w"), indent=2)
+          if bad:
+              raise SystemExit("read-back mismatch: %s" % ", ".join(r["rva"] for r in bad))
+          PY
+
+      - name: rename
+        run: mv work/input.bin "work/${{ inputs.output_name }}"
+
+      - name: summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os
+          path = "work/patch-report.json"
+          if not os.path.exists(path):
+              print("report missing")
+              raise SystemExit(0)
+          data = json.load(open(path))
+          lines = ["| rva | va | segment | file offset | before | after | ok |",
+                   "|---|---|---|---|---|---|---|"]
+          for row in data["patches"]:
+              lines.append("| `%s` | `%s` | `%s` | `%s` | `%s` | `%s` | %s |" %
+                           (row["rva"], row["va"], row["segment"], row["fileoff"],
+                            row["before"], row["after"], row["ok"]))
+          lines.append("")
+          lines.append("base: `%s`, size: %d bytes, issues: %s" %
+                       (data["base"], data["size"], data["issues"] or "none"))
+          open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout"), "a").write("\n".join(lines) + "\n")
+          PY
+
+      - name: artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-${{ github.run_number }}
+          path: work/
+          if-no-files-found: error
+          retention-days: 7
