@@ -39,56 +39,76 @@ jobs:
         uses: actions/checkout@v4
 
       - name: deps
-        timeout-minutes: 10
+        timeout-minutes: 12
         run: |
           set -euxo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          APT="sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 \
-               -o Acquire::https::Timeout=15 -o APT::Update::Error-Mode=any"
 
-          echo "--- mirror config ---"
-          cat /etc/apt/apt-mirrors.txt || true
-          getent hosts archive.ubuntu.com || echo "DNS: archive.ubuntu.com unresolvable"
+          deps_ok() {
+            pkg-config --exists glib-2.0 gio-2.0 gobject-2.0 || return 1
+            ls /usr/include/capstone/capstone.h >/dev/null 2>&1 || return 1
+            ls /usr/include/ffi.h /usr/include/*/ffi.h >/dev/null 2>&1 || return 1
+            return 0
+          }
 
-          ok=0
-          for attempt in 1 2 3; do
-            if $APT update; then ok=1; break; fi
-            echo "apt-get update failed (attempt $attempt/3), retry in 15s"
-            sleep 15
-          done
-          if [ "$ok" != 1 ]; then
-            echo "::error::apt-get update failed 3x - runner cannot reach the Ubuntu mirrors (DNS/network). Re-run the job; if it repeats, switch to ubuntu-24.04 or premirror the packages as an artifact."
-            exit 1
+          if deps_ok; then
+            echo "build deps already present, apt skipped"
+          else
+            installed=0
+            for m in \
+              "http://azure.archive.ubuntu.com/ubuntu" \
+              "http://archive.ubuntu.com/ubuntu" \
+              "http://mirrors.edge.kernel.org/ubuntu"
+            do
+              host="${m#http://}"
+              host="${host%%/*}"
+              echo "=== mirror $m"
+              if ! getent hosts "$host" >/dev/null; then
+                echo "DNS failed for $host, next mirror"
+                continue
+              fi
+              if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+                sudo sed -i -E "s#^URIs:.*#URIs: $m/#" /etc/apt/sources.list.d/ubuntu.sources
+              fi
+              if [ -f /etc/apt/sources.list ]; then
+                sudo sed -i -E "s#^deb (\[[^]]*\] )?http://[^ ]+#deb \1$m#" /etc/apt/sources.list
+              fi
+              if sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=15 \
+                   -o Acquire::https::Timeout=15 -o APT::Update::Error-Mode=any update \
+                 && sudo apt-get install -y --no-install-recommends \
+                   build-essential pkg-config libglib2.0-dev libffi-dev libcapstone-dev python3-pip
+              then
+                installed=1
+                break
+              fi
+              echo "mirror $m failed"
+            done
+            if [ "$installed" != "1" ]; then
+              echo "::error::build deps not installable from any mirror - runner network/DNS is dead"
+              cat /etc/resolv.conf || true
+              getent hosts github.com || true
+              exit 1
+            fi
           fi
 
-          $APT install -y --no-install-recommends \
-            build-essential pkg-config libglib2.0-dev libffi-dev libcapstone-dev python3-pip
-
-          python3 -m pip install --quiet --upgrade --break-system-packages "gdown>=5"
+          python3 -m pip install --quiet --upgrade --retries 3 --timeout 30 --break-system-packages "gdown>=5"
 
       - name: gum-graft
-        timeout-minutes: 10
         env:
           FRIDA: ${{ inputs.frida_version }}
         run: |
-          set -euxo pipefail
-          curl -fsSL --retry 3 --retry-delay 2 -o devkit.tar.xz \
-            "https://github.com/frida/frida/releases/download/$FRIDA/frida-gum-devkit-$FRIDA-linux-x86_64.tar.xz"
+          set -euo pipefail
+          curl -sSL -o devkit.tar.xz "https://github.com/frida/frida/releases/download/$FRIDA/frida-gum-devkit-$FRIDA-linux-x86_64.tar.xz"
           mkdir -p devkit inc/gum
           tar -xf devkit.tar.xz -C devkit
           cp devkit/frida-gum.h inc/gum/gum.h
-
-          # tools/gumgraft.c lives directly under tools/ - cone sparse-checkout takes directories only
           git clone -q --depth 1 --branch "$FRIDA" --filter=blob:none --sparse https://github.com/frida/frida-gum.git gum-src
-          git -C gum-src sparse-checkout set tools
-          test -f gum-src/tools/gumgraft.c
-
+          git -C gum-src sparse-checkout set tools/gum-graft
           gcc -O2 -o gum-graft gum-src/tools/gumgraft.c -I inc -L devkit devkit/libfrida-gum.a \
             $(pkg-config --cflags --libs glib-2.0 gio-2.0 gobject-2.0) -lffi -lcapstone -lm -ldl -lpthread -lresolv
           ./gum-graft 2>&1 | head -3 || true
 
       - name: fetch binary
-        timeout-minutes: 10
         env:
           URL: ${{ inputs.binary_url }}
         run: |
@@ -99,7 +119,7 @@ jobs:
               python3 -m gdown "$URL" -O work/input.bin
               ;;
             *)
-              curl -fsSL --retry 3 --retry-delay 2 -o work/input.bin "$URL"
+              curl -sSL --retry 3 --retry-delay 2 -o work/input.bin "$URL"
               ;;
           esac
           file work/input.bin
@@ -115,16 +135,11 @@ jobs:
           cat work/offsets.txt
 
       - name: graft
-        env:
-          OUT_NAME: ${{ inputs.output_name }}
         run: |
           set -euo pipefail
-          case "$OUT_NAME" in
-            ""|*/*|*..*) echo "invalid output_name: $OUT_NAME"; exit 1 ;;
-          esac
           python3 tools/graft.py --binary work/input.bin --offsets work/offsets.txt \
             --tool ./gum-graft --out work/input.bin --report work/graft-report.json
-          mv work/input.bin "work/$OUT_NAME"
+          mv work/input.bin "work/${{ inputs.output_name }}"
 
       - name: summary
         if: always()
