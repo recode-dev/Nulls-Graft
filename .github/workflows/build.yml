@@ -37,6 +37,14 @@ jobs:
 
       - name: deps
         run: |
+          sudo rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list /etc/apt/sources.list
+          CODENAME=$(grep VERSION_CODENAME /etc/os-release | cut -d= -f2)
+          sudo tee /etc/apt/sources.list >/dev/null <<EOF
+          deb http://archive.ubuntu.com/ubuntu/ $CODENAME main restricted universe multiverse
+          deb http://archive.ubuntu.com/ubuntu/ $CODENAME-updates main restricted universe multiverse
+          deb http://archive.ubuntu.com/ubuntu/ $CODENAME-backports main restricted universe multiverse
+          deb http://security.ubuntu.com/ubuntu/ $CODENAME-security main restricted universe multiverse
+          EOF
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential pkg-config libglib2.0-dev libffi-dev libcapstone-dev python3-pip
           python3 -m pip install --quiet --upgrade --break-system-packages "gdown>=5"
